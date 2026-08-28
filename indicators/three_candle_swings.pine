@@ -3,19 +3,32 @@
 //  Three-Candle Swings  —  Middle-Swing Liquidity
 //  Dow Jones (US30 / YM / DJI) — designed for the 5-minute chart
 //
-//  LEVEL 1  ·  three-candle swing (fractal)
-//      swing high : H[i] > H[i-1]  and  H[i] > H[i+1]
-//      swing low  : L[i] < L[i-1]  and  L[i] < L[i+1]
+//  LEVEL 1 · three-candle swing (equal-price aware)
+//      Neighbouring candles that share the same high (or the same low) are
+//      treated as ONE candle — a "plateau". A plateau is a swing high when the
+//      candle before it AND the candle after it both have a lower high; a swing
+//      low when both have a higher low.
 //
-//  LEVEL 2  ·  the swing we actually use
+//          2 equal highs + 1 lower high  →  swing high            ✔
+//          3 equal highs                 →  swing high            ✔
+//          1 high  + 2 lower highs       →  swing high (classic)  ✔
+//
+//      The swing is anchored to the FIRST candle of the plateau and a plateau
+//      always produces exactly one swing, never one per candle.
+//
+//  LEVEL 2 · the swing we actually use
 //      a level-1 swing that has a level-1 swing of the SAME TYPE on its left
-//      and one on its right, and is more extreme than both of them.
-//      The middle one is the high / low / liquidity level.
+//      and one on its right, and is more extreme than both of them:
 //
 //              L1 high            L1 high  (middle = LEVEL 2)          L1 high
 //                 ^                        ^^^^^                          ^
 //                / \                      /     \                        / \
 //               /   \                    /       \                      /   \
+//
+//      The middle one is the high / low / liquidity level.
+//      Equal level-1 swings (a double top / double bottom at the very same
+//      price) still qualify: the level is placed on the FIRST of them, so one
+//      line covers both touches.
 //
 //  A level-2 swing can only be confirmed once the right-hand level-1 swing
 //  exists, so it is printed a few bars after the actual swing candle. Every
@@ -34,13 +47,17 @@ type Lvl
     line  ln    = na
     label lb    = na
 
+// rolling state of a plateau scan (one per side)
+type RunState
+    float curVal   = na     // price of the plateau being built
+    int   curStart = na     // its first bar
+    float prevVal  = na     // price of the plateau before it
+
 // ─────────────────────────────── Inputs ──────────────────────────────────────
 string gDef = "1 · Swing definition"
-int  nbr        = input.int(1, "Neighbour swings on each side", minval = 1, maxval = 3, group = gDef,
+int  nbr       = input.int(1, "Neighbour swings on each side", minval = 1, maxval = 3, group = gDef,
      tooltip = "1 = one three-candle swing on the left and one on the right (the default setup).\nRaise it to demand a higher-degree swing.")
-bool allowEqual = input.bool(false, "Allow equal highs / lows", group = gDef,
-     tooltip = "OFF (strict): a swing high needs H[i] > H[i-1] AND H[i] > H[i+1].\nON: the left-hand comparison accepts equality (>=), so double tops still register. The right-hand side stays strict, so a run of equal candles produces one swing, not many.")
-bool waitClose  = input.bool(true, "Detect swings on closed bars only", group = gDef,
+bool waitClose = input.bool(true, "Detect swings on closed bars only", group = gDef,
      tooltip = "Keeps a swing from appearing and disappearing while the confirmation candle is still forming.")
 
 string gL1 = "2 · Level 1 — three-candle swings"
@@ -51,6 +68,8 @@ color l1lCol = input.color(color.new(color.maroon, 20), "low",  inline = "L1", g
 string gL2 = "3 · Level 2 — middle swings (our levels)"
 bool  showLbl  = input.bool(true, "Label middle swings", group = gL2)
 bool  showLine = input.bool(true, "Draw liquidity line", group = gL2)
+bool  dedupe   = input.bool(true, "Merge levels sitting at the same price", group = gL2,
+     tooltip = "Stops two separate middle swings at the identical price from drawing two lines on top of each other.")
 int   keepLast = input.int(15, "Keep last N levels per side", minval = 1, maxval = 100, group = gL2)
 color hiCol    = input.color(color.red,  "sell-side (high)", inline = "L2", group = gL2)
 color loCol    = input.color(color.blue, "buy-side (low)",   inline = "L2", group = gL2)
@@ -67,13 +86,17 @@ bool dynAlerts = input.bool(true, "Fire alert() calls with the price", group = g
 
 // ─────────────────────────────── State ───────────────────────────────────────
 // pending level-1 swings: price, bar index, and the first bar that traded through it
-var array<float> h1p = array.new<float>()
-var array<int>   h1b = array.new<int>()
-var array<int>   h1k = array.new<int>()
-var array<float> l1p = array.new<float>()
-var array<int>   l1b = array.new<int>()
-var array<int>   l1k = array.new<int>()
+var array<float> h1p  = array.new<float>()
+var array<int>   h1b  = array.new<int>()
+var array<int>   h1k  = array.new<int>()
+var array<float> l1p  = array.new<float>()
+var array<int>   l1b  = array.new<int>()
+var array<int>   l1k  = array.new<int>()
 var array<Lvl>   lvls = array.new<Lvl>()
+var array<label> marks = array.new<label>()
+
+var RunState hSt = RunState.new()
+var RunState lSt = RunState.new()
 
 int keepL1 = 2 * nbr + 4
 
@@ -81,6 +104,9 @@ float srcUp = sweepBasis == "Close" ? close : high
 float srcDn = sweepBasis == "Close" ? close : low
 
 // ─────────────────────────────── Helpers ─────────────────────────────────────
+// two prices count as equal when they are within half a tick of each other
+eqPx(float a, float b) => math.abs(a - b) < syminfo.mintick * 0.5
+
 killDraw(Lvl lv) =>
     line.delete(lv.ln)
     label.delete(lv.lb)
@@ -108,6 +134,27 @@ markSwept(Lvl lv, int atBar) =>
         label.new(atBar, lv.price, "x", xloc = xloc.bar_index, style = label.style_none,
              textcolor = lv.isHigh ? hiCol : loCol, size = size.small)
 
+// small triangle on every level-1 swing — a visual check of the definition
+addMark(int bx, float px, bool isHigh) =>
+    if showL1
+        array.push(marks, label.new(bx, px, "", xloc = xloc.bar_index,
+             yloc  = isHigh ? yloc.abovebar : yloc.belowbar,
+             style = isHigh ? label.style_triangledown : label.style_triangleup,
+             color = isHigh ? l1hCol : l1lCol, size = size.tiny))
+        while array.size(marks) > 200
+            label.delete(array.shift(marks))
+
+// is there already a live level at this price on this side?
+hasLevel(float px, bool isHigh) =>
+    bool found = false
+    if array.size(lvls) > 0
+        for i = 0 to array.size(lvls) - 1
+            Lvl t = array.get(lvls, i)
+            if t.isHigh == isHigh and not t.swept and eqPx(t.price, px)
+                found := true
+                break
+    found
+
 // keep at most `keepLast` level-2 levels per side
 trimSide(bool isHigh) =>
     int cnt = 0
@@ -130,7 +177,36 @@ trimSide(bool isHigh) =>
         array.remove(lvls, idx)
         cnt -= 1
 
+// ── plateau scan ─────────────────────────────────────────────────────────────
+// Feed one bar per call. Bars with an equal high (or low) extend the current
+// plateau; the first bar with a different price closes it, and that is when we
+// can tell whether the closed plateau was a swing.
+// Returns [swingFound, swingPrice, swingBar].
+stepRun(RunState st, float v, int b, bool isHigh, bool active) =>
+    bool  found = false
+    float px    = na
+    int   bx    = na
+    if active
+        if na(st.curVal)
+            st.curVal   := v
+            st.curStart := b
+        else if not eqPx(v, st.curVal)
+            if not na(st.prevVal)
+                // neighbouring plateaus always differ in price, so > / < is exact
+                bool ok = isHigh ? (st.curVal > st.prevVal and st.curVal > v)
+                                 : (st.curVal < st.prevVal and st.curVal < v)
+                if ok
+                    found := true
+                    px    := st.curVal
+                    bx    := st.curStart
+            st.prevVal  := st.curVal
+            st.curVal   := v
+            st.curStart := b
+    [found, px, bx]
+
 // is the swing sitting `nbr` places from the end more extreme than its neighbours?
+// left side must be beaten outright; on the right an equal swing still counts, so
+// the FIRST of two equal swings becomes the level and the second is skipped.
 evalMid(array<float> px, bool isHigh) =>
     int  n    = array.size(px)
     int  need = 2 * nbr + 1
@@ -142,8 +218,8 @@ evalMid(array<float> px, bool isHigh) =>
         for k = 1 to nbr
             float lft = array.get(px, mi - k)
             float rgt = array.get(px, mi + k)
-            bool okL = isHigh ? (allowEqual ? m >= lft : m > lft) : (allowEqual ? m <= lft : m < lft)
-            bool okR = isHigh ? m > rgt : m < rgt
+            bool okL = isHigh ? m > lft : m < lft
+            bool okR = eqPx(m, rgt) or (isHigh ? m > rgt : m < rgt)
             if not (okL and okR)
                 ok := false
                 break
@@ -161,10 +237,9 @@ if array.size(l1p) > 0
             array.set(l1k, i, bar_index)
 
 // ───────────────────────── Level 1 detection ─────────────────────────────────
-// evaluated on the bar AFTER the swing candle → the swing sits at bar_index - 1
-bool ready = bar_index > 2 and (not waitClose or barstate.isconfirmed)
-bool l1H = ready and (allowEqual ? (high[1] >= high[2] and high[1] > high) : (high[1] > high[2] and high[1] > high))
-bool l1L = ready and (allowEqual ? (low[1]  <= low[2]  and low[1]  < low)  : (low[1]  < low[2]  and low[1]  < low))
+bool active = not waitClose or barstate.isconfirmed
+[l1H, l1Hpx, l1Hbx] = stepRun(hSt, high, bar_index, true,  active)
+[l1L, l1Lpx, l1Lbx] = stepRun(lSt, low,  bar_index, false, active)
 
 // ───────────────────────── Level 2 confirmation ──────────────────────────────
 bool  newHi   = false
@@ -173,40 +248,46 @@ float newHiPx = na
 float newLoPx = na
 
 if l1H
-    array.push(h1p, high[1])
-    array.push(h1b, bar_index - 1)
+    addMark(l1Hbx, l1Hpx, true)
+    array.push(h1p, l1Hpx)
+    array.push(h1b, l1Hbx)
     array.push(h1k, -1)
     if evalMid(h1p, true)
         int   mi = array.size(h1p) - 1 - nbr
-        Lvl   lv = Lvl.new(price = array.get(h1p, mi), bar = array.get(h1b, mi), isHigh = true)
-        int   br = array.get(h1k, mi)                 // already taken before confirmation?
-        lv.swept := br >= 0
-        if not lv.swept or keepSwept
-            drawLevel(lv, lv.swept ? br : bar_index)
-            array.push(lvls, lv)
-            trimSide(true)
-        newHi   := true
-        newHiPx := lv.price
+        float mp = array.get(h1p, mi)
+        if not (dedupe and hasLevel(mp, true))
+            Lvl lv = Lvl.new(price = mp, bar = array.get(h1b, mi), isHigh = true)
+            int br = array.get(h1k, mi)                 // already taken before confirmation?
+            lv.swept := br >= 0
+            if not lv.swept or keepSwept
+                drawLevel(lv, lv.swept ? br : bar_index)
+                array.push(lvls, lv)
+                trimSide(true)
+            newHi   := true
+            newHiPx := mp
     while array.size(h1p) > keepL1
         array.shift(h1p)
         array.shift(h1b)
         array.shift(h1k)
 
 if l1L
-    array.push(l1p, low[1])
-    array.push(l1b, bar_index - 1)
+    addMark(l1Lbx, l1Lpx, false)
+    array.push(l1p, l1Lpx)
+    array.push(l1b, l1Lbx)
     array.push(l1k, -1)
     if evalMid(l1p, false)
         int   mi = array.size(l1p) - 1 - nbr
-        Lvl   lv = Lvl.new(price = array.get(l1p, mi), bar = array.get(l1b, mi), isHigh = false)
-        int   br = array.get(l1k, mi)
-        lv.swept := br >= 0
-        if not lv.swept or keepSwept
-            drawLevel(lv, lv.swept ? br : bar_index)
-            array.push(lvls, lv)
-            trimSide(false)
-        newLo   := true
-        newLoPx := lv.price
+        float mp = array.get(l1p, mi)
+        if not (dedupe and hasLevel(mp, false))
+            Lvl lv = Lvl.new(price = mp, bar = array.get(l1b, mi), isHigh = false)
+            int br = array.get(l1k, mi)
+            lv.swept := br >= 0
+            if not lv.swept or keepSwept
+                drawLevel(lv, lv.swept ? br : bar_index)
+                array.push(lvls, lv)
+                trimSide(false)
+            newLo   := true
+            newLoPx := mp
     while array.size(l1p) > keepL1
         array.shift(l1p)
         array.shift(l1b)
@@ -241,10 +322,6 @@ if not keepSwept and array.size(lvls) > 0
         if lv.swept
             killDraw(lv)
             array.remove(lvls, i)
-
-// ─────────────────────────────── Plots ───────────────────────────────────────
-plotshape(showL1 and l1H, "Level-1 swing high", shape.triangledown, location.abovebar, l1hCol, offset = -1, size = size.tiny)
-plotshape(showL1 and l1L, "Level-1 swing low",  shape.triangleup,   location.belowbar, l1lCol, offset = -1, size = size.tiny)
 
 // ─────────────────────────────── Alerts ──────────────────────────────────────
 alertcondition(newHi,  "Middle swing HIGH formed", "3C Swings | middle swing HIGH confirmed on {{ticker}} {{interval}}")
